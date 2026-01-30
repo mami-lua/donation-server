@@ -3,7 +3,7 @@ const axios = require('axios');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-app.get('/', (req, res) => res.send('MARKETPLACE ENGINE - FIXED WITH NEW API'));
+app.get('/', (req, res) => res.send('MARKETPLACE ENGINE - ROPROXY'));
 
 app.get('/gamepasses/:userId', async (req, res) => {
     const userId = Number(req.params.userId);
@@ -26,62 +26,70 @@ app.get('/gamepasses/:userId', async (req, res) => {
         
         let allPasses = [];
         
-        // ADIM 2: YENİ API ile GamePass'leri çek
+        // ADIM 2: YENİ API'yi ROPROXY üzerinden çağır
         for (const game of gamesRes.data.data) {
             try {
                 const universeId = game.id;
                 
-                // 🔥 YENİ ROBLOX API - Bu kesin çalışır
-                const newApiUrl = `https://apis.roblox.com/game-passes/v1/universes/${universeId}/game-passes?passView=Full&pageSize=100`;
+                // 🔥 ROPROXY ÜZERİNDEN YENİ API
+                const proxyUrl = `https://apis.roproxy.com/game-passes/v1/universes/${universeId}/game-passes?passView=Full&pageSize=100`;
                 
                 console.log(`  → ${game.name} (Universe: ${universeId})`);
                 
-                const passRes = await axios.get(newApiUrl, {
+                const passRes = await axios.get(proxyUrl, {
                     headers: { 
                         'User-Agent': 'Roblox/WinInet',
                         'Accept': 'application/json'
                     },
-                    timeout: 8000
+                    timeout: 8000,
+                    validateStatus: (status) => status >= 200 && status < 500
                 });
                 
-                // YENİ API response formatı: { gamePasses: [...] }
+                if (passRes.status !== 200) {
+                    console.log(`    ⚠️ HTTP ${passRes.status}`);
+                    continue;
+                }
+                
+                // YENİ API response formatı
                 const passes = passRes.data?.gamePasses || [];
                 
                 if (passes.length > 0) {
                     console.log(`    ✅ ${passes.length} GamePass bulundu!`);
                     
                     for (const pass of passes) {
-                        // isForSale kontrolü ve price çek
                         if (pass.price && pass.price > 0) {
                             allPasses.push({
                                 id: pass.id,
                                 price: pass.price,
-                                name: pass.name // Debug için
+                                name: pass.name
                             });
                             console.log(`      → ${pass.name}: ${pass.price}R$`);
                         }
                     }
                 } else {
-                    console.log(`    ⚠️ GamePass yok`);
+                    console.log(`    ⚠️ GamePass yok veya hiçbiri satışta değil`);
                 }
                 
             } catch (err) {
-                console.log(`    ❌ Error: ${err.message}`);
-                // Eğer yeni API çalışmazsa eski catalog API'yi dene
+                console.log(`    ❌ RoProxy Error: ${err.message}`);
+                
+                // FALLBACK: Catalog API dene (bu kesin çalışır)
                 try {
                     console.log(`    🔄 Catalog API deneniyor...`);
-                    const catalogUrl = `https://catalog.roblox.com/v1/search/items?Category=11&CreatorTargetId=${userId}&CreatorType=User&SalesTypeFilter=1&Limit=100`;
+                    const catalogUrl = `https://catalog.roproxy.com/v1/search/items?Category=11&CreatorTargetId=${userId}&CreatorType=User&SalesTypeFilter=1&Limit=100`;
                     const catalogRes = await axios.get(catalogUrl, {
                         headers: { 'User-Agent': 'Roblox/WinInet' },
                         timeout: 5000
                     });
                     
-                    if (catalogRes.data?.data) {
-                        const catalogPasses = catalogRes.data.data.map(p => ({
-                            id: p.id,
-                            price: p.price || 0,
-                            name: p.name
-                        }));
+                    if (catalogRes.data?.data && catalogRes.data.data.length > 0) {
+                        const catalogPasses = catalogRes.data.data
+                            .filter(p => p.price > 0)
+                            .map(p => ({
+                                id: p.id,
+                                price: p.price,
+                                name: p.name
+                            }));
                         allPasses.push(...catalogPasses);
                         console.log(`    ✅ Catalog'dan ${catalogPasses.length} pass bulundu`);
                     }
@@ -90,39 +98,58 @@ app.get('/gamepasses/:userId', async (req, res) => {
                 }
             }
             
-            // Rate limit için bekleme
-            await new Promise(r => setTimeout(r, 400));
+            // Rate limit
+            await new Promise(r => setTimeout(r, 300));
         }
         
         if (allPasses.length === 0) {
             console.log("❌ HİÇBİR GAMEPASS BULUNAMADI");
-            return res.json({ data: [] });
+            
+            // SON ÇARE: Direkt kullanıcının tüm GamePass'lerini Catalog'dan çek
+            try {
+                console.log("🔄 Son çare: Direkt Catalog sorgusu...");
+                const lastResortUrl = `https://catalog.roproxy.com/v1/search/items?Category=11&CreatorTargetId=${userId}&CreatorType=User&SalesTypeFilter=1&Limit=100`;
+                const lastRes = await axios.get(lastResortUrl, {
+                    headers: { 'User-Agent': 'Roblox/WinInet' },
+                    timeout: 8000
+                });
+                
+                if (lastRes.data?.data && lastRes.data.data.length > 0) {
+                    allPasses = lastRes.data.data
+                        .filter(p => p.price > 0)
+                        .map(p => ({ id: p.id, price: p.price }));
+                    console.log(`✅ Son çare başarılı: ${allPasses.length} pass`);
+                }
+            } catch (lastErr) {
+                console.log("❌ Son çare de başarısız");
+            }
+            
+            if (allPasses.length === 0) {
+                return res.json({ data: [] });
+            }
         }
         
         // Fiyata göre sırala
         allPasses.sort((a, b) => a.price - b.price);
         
-        // Name'i çıkar (sadece id ve price)
-        const finalPasses = allPasses.map(p => ({ id: p.id, price: p.price }));
-        
-        // Duplicate'leri temizle (aynı ID'ye sahip pass'ler varsa)
+        // Duplicate temizle
         const uniquePasses = [];
         const seenIds = new Set();
-        for (const pass of finalPasses) {
+        for (const pass of allPasses) {
             if (!seenIds.has(pass.id)) {
                 seenIds.add(pass.id);
-                uniquePasses.push(pass);
+                uniquePasses.push({ id: pass.id, price: pass.price });
             }
         }
         
-        console.log(`\n✅✅✅ TOPLAM ${uniquePasses.length} GAMEPASS BULUNDU ✅✅✅\n`);
+        console.log(`\n✅✅✅ TOPLAM ${uniquePasses.length} GAMEPASS ✅✅✅\n`);
         
         res.json({ data: uniquePasses });
         
     } catch (e) {
-        console.error("❌ FATAL ERROR:", e.message);
+        console.error("❌ FATAL:", e.message);
         res.json({ error: e.message, data: [] });
     }
 });
 
-app.listen(PORT, () => console.log(`🚀 Server Port ${PORT}`));
+app.listen(PORT, () => console.log(`🚀 Port ${PORT}`));
