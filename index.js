@@ -10,80 +10,124 @@ const axiosConfig = {
     headers: { 'User-Agent': 'Roblox/WinInet' }
 };
 
-// YARDIMCI FONKSİYON: Fiyat Sorgulayıcı
-// Pls Donate mantığı: ID ver, Fiyat al.
+// FİYAT SORGULAYICI (Economy API)
 async function getGamePassPrice(passId) {
     try {
         const url = `https://economy.roproxy.com/v1/game-passes/${passId}/product-info`;
         const r = await axios.get(url, axiosConfig);
-        // PriceInRobux varsa döndür, yoksa 0
-        return r.data?.PriceInRobux || 0;
+        // PriceInRobux varsa ve satışta ise (IsForSale)
+        if (r.data && r.data.IsForSale && r.data.PriceInRobux > 0) {
+            return r.data.PriceInRobux;
+        }
+        return 0;
     } catch {
-        return 0; // Hata varsa (silinmiş vs.) 0 dön
+        return 0;
     }
 }
 
-app.get('/', (req, res) => res.send('PRICE CHECKER API V6 HAZIR'));
+app.get('/', (req, res) => res.send('UNIVERSE ASSETS API HAZIR'));
 
 app.get('/gamepasses/:userId', async (req, res) => {
     const userId = parseInt(req.params.userId);
     console.log(`\n>>> SORGULANIYOR: ${userId}`);
     
-    let finalPasses = [];
+    let allPasses = [];
 
     try {
-        // --- 1. PLAN: INVENTORY API (Hızlı Yöntem) ---
-        // Burası fiyatı direkt verir, ekstra sorguya gerek kalmaz.
-        const invUrl = `https://inventory.roproxy.com/v2/users/${userId}/inventory?assetTypes=GamePass&limit=100&sortOrder=Asc`;
-        const invRes = await axios.get(invUrl, axiosConfig);
+        // --- 1. ADIM: OYUNLARI (UNIVERSE) BUL ---
+        // Hem "Public" oyunları hem de "Created" oyunları bulmak için geniş tarama.
+        // Public oyunları bulmak kolaydır, ama bazen oyun public olsa bile listede çıkmaz.
+        // O yüzden önce "games" endpointini kullanıyoruz.
         
-        let rawPasses = invRes.data?.data || [];
+        let universeIds = new Set();
         
-        // Eğer Inventory'den veri geldiyse, formatlayıp kullanalım
-        if (rawPasses.length > 0) {
-            console.log(`   [1] Inventory API'den ${rawPasses.length} pass geldi.`);
-            finalPasses = rawPasses
-                .filter(p => p.price && p.price > 0)
-                .map(p => ({
-                    id: p.assetId, // Inventory API "assetId" kullanır
-                    price: p.price
-                }));
+        const gamesUrl = `https://games.roproxy.com/v2/users/${userId}/games?accessFilter=Public&limit=50&sortOrder=Asc`;
+        const gamesRes = await axios.get(gamesUrl, axiosConfig);
+        
+        if (gamesRes.data && gamesRes.data.data) {
+            gamesRes.data.data.forEach(g => universeIds.add(g.id));
+        }
+        
+        console.log(`   > Bulunan Universe Sayısı: ${universeIds.size}`);
+
+        if (universeIds.size === 0) {
+             console.log("   ⚠️ Hiç oyun bulunamadı. GamePass olması imkansız.");
+             return res.json({ data: [] });
         }
 
-        // --- 2. PLAN: FALLBACK (Created Items + Price Check) ---
-        // Eğer Inventory boşsa (gizliyse), buraya gir.
-        if (finalPasses.length === 0) {
-            console.log("   ⚠️ Inventory boş veya gizli. Fallback (Created Items) + Fiyat Sorgulama başlıyor...");
-            
-            const createdUrl = `https://users.roproxy.com/v1/users/${userId}/created-items/GamePass?limit=100&sortOrder=Asc`;
-            const createdRes = await axios.get(createdUrl, axiosConfig);
-            const createdItems = createdRes.data?.data || [];
-            
-            console.log(`   > Bulunan Ham Pass Sayısı: ${createdItems.length} (Fiyatları kontrol ediliyor...)`);
+        // --- 2. ADIM: ASSETS ENDPOINT (KRİTİK NOKTA) ---
+        // Her universe için "assets" endpointini kullanacağız.
+        const uniArray = Array.from(universeIds);
+        
+        // Her Universe için tarama başlat
+        const universePromises = uniArray.map(async (uniId) => {
+            try {
+                // YAZILIMCININ İSTEDİĞİ ENDPOINT: games/{id}/assets?assetTypes=GamePass
+                const assetsUrl = `https://games.roproxy.com/v1/games/${uniId}/assets?assetTypes=GamePass&limit=100&sortOrder=Asc`;
+                const assetsRes = await axios.get(assetsUrl, axiosConfig);
+                
+                const assets = assetsRes.data?.data || [];
+                return assets; // Ham asset listesini dön
+            } catch (e) {
+                return [];
+            }
+        });
 
-            // Tek tek fiyatlarını sor (Paralel yapıyoruz, hızlı olsun)
-            const pricePromises = createdItems.map(async (item) => {
-                const price = await getGamePassPrice(item.id);
-                if (price > 0) {
-                    return { id: item.id, price: price };
-                }
-                return null; // Fiyatı yoksa veya satışta değilse null
+        const results = await Promise.all(universePromises);
+        const rawAssets = results.flat();
+
+        console.log(`   > Toplam Asset Bulundu: ${rawAssets.length} (Filtreleniyor...)`);
+
+        // --- 3. ADIM: FİLTRELEME VE FİYAT KONTROLÜ ---
+        // Asset listesinde başkasının passleri olabilir veya fiyatı olmayabilir.
+        
+        const validPasses = [];
+        
+        // Assetlerin detaylarını kontrol et (Parallel değil seri yapalım, rate limit yemeyelim veya chunk yapalım)
+        // 10'arlı gruplar halinde fiyat soralım
+        const chunkArray = (arr, size) => arr.length > size ? [arr.slice(0, size), ...chunkArray(arr.slice(size), size)] : [arr];
+        
+        for (const chunk of chunkArray(rawAssets, 10)) {
+            const pricePromises = chunk.map(async (asset) => {
+                // Sadece pass ID'si asset.id dir.
+                // Creator kontrolü: Bu pass gerçekten bizim adamın mı?
+                // asset.creator alanı bazen null gelebilir, o yüzden dikkat.
+                
+                // NOT: Asset endpointinde bazen creator bilgisi eksik olabilir.
+                // En güvenlisi Price Check yaparken gelen veriden creator kontrolü yapmaktır.
+                
+                try {
+                    const infoUrl = `https://economy.roproxy.com/v1/game-passes/${asset.id}/product-info`;
+                    const r = await axios.get(infoUrl, axiosConfig);
+                    const info = r.data;
+
+                    if (info && info.PriceInRobux > 0 && info.IsForSale) {
+                        // BURASI KRİTİK: Creator kontrolünü burada yapıyoruz (Kesin Bilgi)
+                        if (info.Creator.CreatorTargetId === userId) {
+                            return {
+                                id: asset.id,
+                                price: info.PriceInRobux
+                            };
+                        }
+                    }
+                } catch (e) {}
+                return null;
             });
-
-            // Hepsini bekle
-            const checkedPasses = await Promise.all(pricePromises);
             
-            // Null olanları temizle
-            finalPasses = checkedPasses.filter(p => p !== null);
+            const chunkResults = await Promise.all(pricePromises);
+            chunkResults.forEach(r => {
+                if (r) validPasses.push(r);
+            });
         }
 
         // --- SONUÇ ---
-        // Sırala
-        finalPasses.sort((a, b) => a.price - b.price);
+        // ID tekrarını önle
+        const uniquePasses = [...new Map(validPasses.map(item => [item['id'], item])).values()];
+        uniquePasses.sort((a, b) => a.price - b.price);
 
-        console.log("FINAL PASS COUNT:", finalPasses.length);
+        console.log("FINAL PASS COUNT:", uniquePasses.length);
         
-        res.json({ data: finalPasses });
+        res.json({ data: uniquePasses });
 
     } catch (e) {
         console.error("❌ ERROR:", e.message);
