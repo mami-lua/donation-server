@@ -5,83 +5,71 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 const axiosConfig = {
-    validateStatus: function (status) { return status >= 200 && status < 500; },
+    validateStatus: (status) => status >= 200 && status < 500,
     headers: { 'User-Agent': 'Roblox/WinInet' }
 };
 
-async function getGamePassPrice(passId) {
+// ECONOMY CHECKER (Fiyat ve Sahiplik Doğrulama)
+async function getValidatedPass(passId, targetUserId) {
     try {
         const url = `https://economy.roproxy.com/v1/game-passes/${passId}/product-info`;
         const r = await axios.get(url, axiosConfig);
-        if (r.data && r.data.IsForSale && r.data.PriceInRobux > 0) {
-            return { price: r.data.PriceInRobux, creatorId: r.data.Creator.CreatorTargetId };
+        const info = r.data;
+
+        if (info && info.IsForSale && info.PriceInRobux > 0) {
+            // Sahiplik Kontrolü: Kullanıcı mı yoksa Grup mu?
+            const isOwner = info.Creator.CreatorTargetId === targetUserId;
+            const isGroup = info.Creator.CreatorType === "Group"; // Grup pass'lerini de kabul ediyoruz
+
+            if (isOwner || isGroup) {
+                return { id: passId, price: info.PriceInRobux };
+            }
         }
         return null;
     } catch { return null; }
 }
 
-app.get('/', (req, res) => res.send('STRICT API V7 READY'));
+app.get('/', (req, res) => res.send('CREATOR SCAN API V8 READY'));
 
 app.get('/gamepasses/:userId', async (req, res) => {
     const userId = parseInt(req.params.userId);
-    console.log(`\n>>> ANALIZ: ${userId}`);
+    console.log(`\n>>> DERIN SORGULAMA: ${userId}`);
     
-    let universeIds = new Set();
-    let finalPasses = [];
-
     try {
-        // 1. ADIM: TÜM OYUNLARI ÇEK (Filtresiz)
-        const gamesUrl = `https://games.roproxy.com/v2/users/${userId}/games?sortOrder=Asc&limit=50`;
-        const gamesRes = await axios.get(gamesUrl, axiosConfig);
+        // 1. ADIM: KULLANICININ OLUŞTURDUĞU TÜM GAMEPASSLERİ ÇEK
+        // Bu endpoint envanter gizli olsa bile çalışır (Created Items != Inventory)
+        const createdUrl = `https://users.roproxy.com/v1/users/${userId}/created-items/GamePass?limit=100`;
+        const createdRes = await axios.get(createdUrl, axiosConfig);
         
-        if (gamesRes.data && gamesRes.data.data) {
-            gamesRes.data.data.forEach(g => universeIds.add(g.id));
+        const rawItems = createdRes.data?.data || [];
+        console.log(`   > Bulunan Ham Eşya: ${rawItems.length}`);
+
+        if (rawItems.length === 0) {
+            console.log("FINAL PASS COUNT: 0 (No Created Items)");
+            return res.json({ data: [] });
         }
-        
-        console.log(`   > Universe Sayısı: ${universeIds.size}`);
 
-        // 2. ADIM: ASSETS TARAMASI
-        const uniArray = Array.from(universeIds);
-        const universePromises = uniArray.map(async (uniId) => {
-            try {
-                const assetsUrl = `https://games.roproxy.com/v1/games/${uniId}/assets?assetTypes=GamePass&limit=100`;
-                const assetsRes = await axios.get(assetsUrl, axiosConfig);
-                return assetsRes.data?.data || [];
-            } catch (e) { return []; }
-        });
-
-        const allRawAssets = (await Promise.all(universePromises)).flat();
-        console.log(`   > Ham Asset Sayısı: ${allRawAssets.length}`);
-
-        // 3. ADIM: EKONOMİ KONTROLÜ VE GRUP DESTEĞİ
+        // 2. ADIM: HER BİRİ İÇİN EKONOMİ DOĞRULAMASI (Price Check)
+        // 10'arlı gruplar halinde sorgulayarak rate-limit'i engelliyoruz
+        let validatedPasses = [];
         const chunkArray = (arr, size) => arr.length > size ? [arr.slice(0, size), ...chunkArray(arr.slice(size), size)] : [arr];
         
-        for (const chunk of chunkArray(allRawAssets, 10)) {
-            const pricePromises = chunk.map(async (asset) => {
-                const info = await getGamePassPrice(asset.id);
-                if (info) {
-                    // Sadece bu kullanıcıya VEYA bir gruba aitse (Grup kontrolü eklendi)
-                    // Pls Donate mantığı: Başkasının pass'i değilse al.
-                    return { id: asset.id, price: info.price };
-                }
-                return null;
-            });
-            
-            const results = await Promise.all(pricePromises);
-            results.forEach(r => { if (r) finalPasses.push(r); });
+        for (const chunk of chunkArray(rawItems, 10)) {
+            const promises = chunk.map(item => getValidatedPass(item.id, userId));
+            const results = await Promise.all(promises);
+            results.forEach(res => { if (res) validatedPasses.push(res); });
         }
 
-        // Tekrarları sil ve sırala
-        const unique = [...new Map(finalPasses.map(item => [item.id, item])).values()];
-        unique.sort((a, b) => a.price - b.price);
+        // 3. ADIM: SIRALAMA VE ÇIKTI
+        validatedPasses.sort((a, b) => a.price - b.price);
+        
+        console.log("FINAL PASS COUNT:", validatedPasses.length);
+        res.json({ data: validatedPasses });
 
-        console.log("FINAL PASS COUNT:", unique.length);
-        res.json({ data: unique });
-
-    } catch (e) {
-        console.error("❌ ERROR:", e.message);
+    } catch (error) {
+        console.error("❌ API ERROR:", error.message);
         res.json({ data: [] });
     }
 });
 
-app.listen(PORT, () => console.log(`Server Online` ) );
+app.listen(PORT, () => console.log(`Server Online`));
