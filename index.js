@@ -5,58 +5,76 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 app.get('/', (req, res) => {
-    res.send('Universe/Gamepass Tarayıcı Calisiyor!');
+    res.send('Deep Scan API Calisiyor!');
 });
 
 app.get('/gamepasses/:userId', async (req, res) => {
     const userId = req.params.userId;
-    console.log(`>>> TARAMA BAŞLADI: ${userId}`);
+    console.log(`\n>>> DERİN TARAMA BAŞLADI: ${userId}`);
 
     try {
-        // 1. ADIM: Kullanıcının halka açık oyunlarını (Universe) bul
-        // Limit 50 oyun (Çoğu kişi için yeterli)
-        const gamesUrl = `https://games.roproxy.com/v2/users/${userId}/games?accessFilter=Public&limit=50&sortOrder=Asc`;
-        
-        const gamesResponse = await axios.get(gamesUrl);
-        const games = gamesResponse.data.data || [];
+        // 1. ADIM: ENVANTERDEN "PLACE" (MEKAN) LİSTESİNİ ÇEK
+        // Bu yöntem oyunun public listesinde görünmese bile, senin envanterinde olduğu için onu bulur.
+        const inventoryUrl = `https://inventory.roproxy.com/v2/users/${userId}/inventory?assetTypes=Place&limit=100&sortOrder=Asc`;
+        const invResponse = await axios.get(inventoryUrl);
+        const places = invResponse.data.data || [];
 
-        console.log(`   > ${games.length} adet oyun bulundu. İçleri taranıyor...`);
-
-        if (games.length === 0) {
+        if (places.length === 0) {
+            console.log("   ! Kullanıcının envanterinde hiç oyun (Place) bulunamadı.");
             return res.json({ success: true, data: [] });
         }
 
-        // 2. ADIM: Her oyunun içindeki Gamepassleri paralel olarak çek
-        // Promise.all kullanarak hepsine aynı anda istek atıyoruz (Çok hızlı olur)
-        const passPromises = games.map(async (game) => {
+        console.log(`   > Envanterde ${places.length} adet Place (Mekan) bulundu.`);
+
+        // 2. ADIM: PLACE ID'LERİNİ UNIVERSE ID'YE ÇEVİR
+        // Gamepass'ler Universe'e bağlıdır, Place ID ile gamepass çekilemez.
+        const placeIds = places.map(p => p.assetId);
+        let universeIds = [];
+
+        // Roblox API'si en fazla 50 ID'yi aynı anda çevirebilir, o yüzden bölerek soruyoruz
+        const chunkArray = (arr, size) => arr.length > size ? [arr.slice(0, size), ...chunkArray(arr.slice(size), size)] : [arr];
+        const chunks = chunkArray(placeIds, 50);
+
+        for (const chunk of chunks) {
             try {
-                const passUrl = `https://games.roproxy.com/v1/games/${game.id}/gamepasses?limit=100&sortOrder=Asc`;
+                const universeUrl = `https://games.roproxy.com/v1/games/multiget-place-details?placeIds=${chunk.join(',')}`;
+                const uniResponse = await axios.get(universeUrl);
+                const universes = uniResponse.data || [];
+                universes.forEach(u => universeIds.push(u.id));
+            } catch (err) {
+                console.error("   ! Universe ID çevirme hatası:", err.message);
+            }
+        }
+
+        console.log(`   > ${universeIds.length} adet Universe ID tespit edildi. Gamepassler taranıyor...`);
+
+        // 3. ADIM: HER UNIVERSE İÇİN GAMEPASSLERİ ÇEK
+        const passPromises = universeIds.map(async (uniId) => {
+            try {
+                const passUrl = `https://games.roproxy.com/v1/games/${uniId}/gamepasses?limit=100&sortOrder=Asc`;
                 const passResponse = await axios.get(passUrl);
                 const passes = passResponse.data.data || [];
                 
-                // Sadece fiyatı olanları döndür
                 return passes.filter(p => p.price && p.price > 0).map(p => ({
                     id: p.id,
                     price: p.price,
-                    name: p.name, // İsim de ekledik, loglarda görmek için
-                    gameName: game.name
+                    name: p.name
                 }));
             } catch (err) {
-                console.error(`   ! Hata (Game ID ${game.id}): ${err.message}`);
                 return [];
             }
         });
 
-        // Tüm taramaların bitmesini bekle
         const results = await Promise.all(passPromises);
-
-        // 3. ADIM: Sonuçları tek bir listede birleştir (Flatten)
         let allPasses = results.flat();
+
+        // Aynı gamepass'ten birden fazla varsa temizle (Nadir olur ama olsun)
+        allPasses = [...new Map(allPasses.map(item => [item['id'], item])).values()];
 
         // Fiyata göre sırala
         allPasses.sort((a, b) => a.price - b.price);
 
-        console.log(`✅ TOPLAM: ${allPasses.length} adet gamepass bulundu ve gönderildi.`);
+        console.log(`✅ İŞLEM TAMAM: Toplam ${allPasses.length} adet gamepass bulundu.`);
         
         res.json({
             success: true,
@@ -64,7 +82,7 @@ app.get('/gamepasses/:userId', async (req, res) => {
         });
 
     } catch (error) {
-        console.error("❌ GENEL HATA:", error.message);
+        console.error("❌ KRİTİK HATA:", error.message);
         res.status(500).json({
             success: false,
             message: "API Hatası",
