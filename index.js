@@ -4,88 +4,100 @@ const app = express();
 
 const PORT = process.env.PORT || 3000;
 
+// Axios ayarları: Hata alsa bile sunucuyu çökertme
+const axiosConfig = {
+    validateStatus: function (status) {
+        return status >= 200 && status < 500; // Sadece 500+ hatalarda patla
+    },
+    headers: {
+        'User-Agent': 'Roblox/WinInet' // Roblox tarayıcısı gibi davran
+    }
+};
+
 app.get('/', (req, res) => {
-    res.send('Deep Scan API Calisiyor!');
+    res.send('Hybrid Scanner API Calisiyor v3!');
 });
 
 app.get('/gamepasses/:userId', async (req, res) => {
     const userId = req.params.userId;
-    console.log(`\n>>> DERİN TARAMA BAŞLADI: ${userId}`);
+    console.log(`\n>>> TARAMA BAŞLADI: ${userId}`);
+    let allPasses = [];
 
     try {
-        // 1. ADIM: ENVANTERDEN "PLACE" (MEKAN) LİSTESİNİ ÇEK
-        // Bu yöntem oyunun public listesinde görünmese bile, senin envanterinde olduğu için onu bulur.
-        const inventoryUrl = `https://inventory.roproxy.com/v2/users/${userId}/inventory?assetTypes=Place&limit=100&sortOrder=Asc`;
-        const invResponse = await axios.get(inventoryUrl);
-        const places = invResponse.data.data || [];
-
-        if (places.length === 0) {
-            console.log("   ! Kullanıcının envanterinde hiç oyun (Place) bulunamadı.");
-            return res.json({ success: true, data: [] });
+        // --- YÖNTEM 1: KATALOG TARAMASI (En Temiz Yöntem) ---
+        console.log("   [1/2] Katalog taranıyor...");
+        const catalogUrl = `https://catalog.roproxy.com/v1/search/items?category=GamePass&creatorTargetId=${userId}&creatorType=User&limit=100&sortOrder=Asc`;
+        
+        const catResponse = await axios.get(catalogUrl, axiosConfig);
+        
+        if (catResponse.data && catResponse.data.data) {
+            const catPasses = catResponse.data.data;
+            console.log(`      > Katalogdan ${catPasses.length} sonuç geldi.`);
+            
+            catPasses.forEach(p => {
+                if (p.price && p.price > 0) {
+                    allPasses.push({ id: p.id, price: p.price, name: p.name });
+                }
+            });
         }
 
-        console.log(`   > Envanterde ${places.length} adet Place (Mekan) bulundu.`);
+        // --- YÖNTEM 2: OYUN İÇİ TARAMA (Yedek Yöntem) ---
+        // Eğer katalogdan veri gelmediyse veya az geldiyse oyunlara da bak.
+        console.log("   [2/2] Public Oyunlar taranıyor...");
+        const gamesUrl = `https://games.roproxy.com/v2/users/${userId}/games?accessFilter=Public&limit=50&sortOrder=Asc`;
+        const gamesResponse = await axios.get(gamesUrl, axiosConfig);
+        
+        if (gamesResponse.data && gamesResponse.data.data) {
+            const games = gamesResponse.data.data;
+            console.log(`      > ${games.length} adet oyun bulundu.`);
 
-        // 2. ADIM: PLACE ID'LERİNİ UNIVERSE ID'YE ÇEVİR
-        // Gamepass'ler Universe'e bağlıdır, Place ID ile gamepass çekilemez.
-        const placeIds = places.map(p => p.assetId);
-        let universeIds = [];
-
-        // Roblox API'si en fazla 50 ID'yi aynı anda çevirebilir, o yüzden bölerek soruyoruz
-        const chunkArray = (arr, size) => arr.length > size ? [arr.slice(0, size), ...chunkArray(arr.slice(size), size)] : [arr];
-        const chunks = chunkArray(placeIds, 50);
-
-        for (const chunk of chunks) {
-            try {
-                const universeUrl = `https://games.roproxy.com/v1/games/multiget-place-details?placeIds=${chunk.join(',')}`;
-                const uniResponse = await axios.get(universeUrl);
-                const universes = uniResponse.data || [];
-                universes.forEach(u => universeIds.push(u.id));
-            } catch (err) {
-                console.error("   ! Universe ID çevirme hatası:", err.message);
-            }
-        }
-
-        console.log(`   > ${universeIds.length} adet Universe ID tespit edildi. Gamepassler taranıyor...`);
-
-        // 3. ADIM: HER UNIVERSE İÇİN GAMEPASSLERİ ÇEK
-        const passPromises = universeIds.map(async (uniId) => {
-            try {
-                const passUrl = `https://games.roproxy.com/v1/games/${uniId}/gamepasses?limit=100&sortOrder=Asc`;
-                const passResponse = await axios.get(passUrl);
-                const passes = passResponse.data.data || [];
-                
-                return passes.filter(p => p.price && p.price > 0).map(p => ({
-                    id: p.id,
-                    price: p.price,
-                    name: p.name
-                }));
-            } catch (err) {
+            const gamePromises = games.map(async (game) => {
+                const passUrl = `https://games.roproxy.com/v1/games/${game.id}/gamepasses?limit=100&sortOrder=Asc`;
+                const passRes = await axios.get(passUrl, axiosConfig);
+                if (passRes.data && passRes.data.data) {
+                    return passRes.data.data.filter(p => p.price > 0).map(p => ({
+                        id: p.id, price: p.price, name: p.name
+                    }));
+                }
                 return [];
+            });
+
+            const gameResults = await Promise.all(gamePromises);
+            const gamePasses = gameResults.flat();
+            console.log(`      > Oyunlardan ${gamePasses.length} pass bulundu.`);
+            
+            // Bulunanları ana listeye ekle
+            allPasses = allPasses.concat(gamePasses);
+        }
+
+        // --- TEMİZLİK VE FİNAL ---
+        
+        // Çift kayıtları temizle (Hem katalogda hem oyunda bulmuş olabilir)
+        const uniquePasses = [];
+        const map = new Map();
+        for (const item of allPasses) {
+            if(!map.has(item.id)){
+                map.set(item.id, true);
+                uniquePasses.push(item);
             }
-        });
+        }
 
-        const results = await Promise.all(passPromises);
-        let allPasses = results.flat();
+        // Sırala
+        uniquePasses.sort((a, b) => a.price - b.price);
 
-        // Aynı gamepass'ten birden fazla varsa temizle (Nadir olur ama olsun)
-        allPasses = [...new Map(allPasses.map(item => [item['id'], item])).values()];
-
-        // Fiyata göre sırala
-        allPasses.sort((a, b) => a.price - b.price);
-
-        console.log(`✅ İŞLEM TAMAM: Toplam ${allPasses.length} adet gamepass bulundu.`);
+        console.log(`✅ SONUÇ: Toplam ${uniquePasses.length} eşsiz gamepass gönderiliyor.`);
         
         res.json({
             success: true,
-            data: allPasses
+            data: uniquePasses
         });
 
     } catch (error) {
-        console.error("❌ KRİTİK HATA:", error.message);
-        res.status(500).json({
+        console.error("❌ BEKLENMEYEN HATA:", error.message);
+        // Hata olsa bile JSON dön ki Roblox Lua scripti HTTP 500 yemesin
+        res.json({
             success: false,
-            message: "API Hatası",
+            data: [], // Boş liste dön, oyun çökmesin
             error: error.message
         });
     }
